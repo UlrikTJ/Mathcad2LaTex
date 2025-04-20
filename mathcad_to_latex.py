@@ -194,6 +194,13 @@ class MathcadToLatexTranslator:
         # Remove outer parentheses if they exist
         expression = expression.strip()
         
+        # Check if we have a complex expression with symbolic evaluation
+        if (expression.startswith("(/") or expression.startswith("(*") or 
+            expression.startswith("(+") or expression.startswith("(-")) and (
+            "(@LABEL" in expression or "(@APPLY" in expression):
+            # This is likely a complex evaluation result - parse it as a whole
+            return self._handle_complex_evaluation(expression)
+        
         # Handle direct arithmetic operations in parentheses
         if expression.startswith("(+"):
             return self._handle_addition(expression)
@@ -204,7 +211,7 @@ class MathcadToLatexTranslator:
         elif expression.startswith("(/"):
             return self._handle_division(expression)
         elif expression.startswith("(^"):
-            return self._handle_power_operation(expression)
+            return self._handle_power(expression)
         
         # Handle special constants
         if expression == "e":
@@ -301,7 +308,201 @@ class MathcadToLatexTranslator:
         else:
             # If it's a simple expression (like a variable or number)
             return self._add_spaces_after_commands(expression)
+
+    def _handle_complex_evaluation(self, expression):
+        """
+        Handle complex evaluation expressions from MathCad that contain nested labeled entities.
+        
+        Args:
+            expression (str): The complex MathCad expression
             
+        Returns:
+            str: The equivalent LaTeX expression
+        """
+        # First, try to identify the root operation
+        if expression.startswith("(/"):
+            # This is a division operation
+            # Find the arguments by carefully parsing
+            content = expression[2:-1].strip()  # Remove "(/" and closing ")"
+            
+            # Split content at top level
+            args = self._split_at_top_level(content)
+            
+            if len(args) >= 2:
+                numerator = self.parse_expression(args[0])
+                denominator = self.parse_expression(args[1])
+                return f"\\frac{{{numerator}}}{{{denominator}}}"
+            else:
+                # Fallback to normal parsing if we can't identify the structure
+                return self._handle_division(expression)
+                
+        elif expression.startswith("(*"):
+            # This is a multiplication operation
+            content = expression[2:-1].strip()  # Remove "(*" and closing ")"
+            
+            # Split content at top level
+            args = self._split_at_top_level(content)
+            
+            if args:
+                # Parse each argument and join with multiplication
+                parsed_args = [self.parse_expression(arg) for arg in args]
+                return " \\cdot ".join(parsed_args)
+            else:
+                # Fallback
+                return self._handle_multiplication(expression)
+                
+        elif expression.startswith("(+"):
+            # This is an addition operation
+            content = expression[2:-1].strip()  # Remove "(+" and closing ")"
+            
+            # Split content at top level
+            args = self._split_at_top_level(content)
+            
+            if args:
+                # Parse each argument and join with addition
+                parsed_args = [self.parse_expression(arg) for arg in args]
+                return " + ".join(parsed_args)
+            else:
+                # Fallback
+                return self._handle_addition(expression)
+                
+        elif expression.startswith("(-"):
+            # This is a subtraction operation
+            content = expression[2:-1].strip()  # Remove "(-" and closing ")"
+            
+            # Split content at top level
+            args = self._split_at_top_level(content)
+            
+            if len(args) >= 2:
+                minuend = self.parse_expression(args[0])
+                subtrahend = self.parse_expression(args[1])
+                return f"{minuend} - {subtrahend}"
+            else:
+                # Fallback
+                return self._handle_subtraction(expression)
+        
+        # If we get here, we couldn't identify a specific structure
+        # Let's try a more general approach by recursively parsing the expression
+        
+        # Replace labeled entities with their LaTeX representations
+        pattern = r'\(@LABEL\s+([A-Z]+)\s+([^)]+)\)'
+        
+        def replace_labels(match):
+            label_type = match.group(1)
+            content = match.group(2)
+            if label_type.upper() == "CONSTANT":
+                if content in self.constants:
+                    return self.constants[content]
+                return content
+            elif label_type.upper() == "VARIABLE":
+                return content
+            elif label_type.upper() == "UNIT":
+                if content in self.units:
+                    return self.units[content]
+                return f"\\mathrm{{{content}}}"
+            elif label_type.upper() == "FUNCTION":
+                return f"\\operatorname{{{content}}}"
+            return content
+            
+        # First pass: replace labels
+        modified_expr = re.sub(pattern, replace_labels, expression)
+        
+        # Replace function applications
+        func_pattern = r'\(@APPLY\s+([^)]+)\s+\(@ARGS\s+([^)]+)\)\)'
+        
+        def replace_functions(match):
+            func_name = match.group(1)
+            arg = match.group(2)
+            
+            # Handle labeled function
+            if func_name.startswith('(@LABEL'):
+                label_match = re.search(r'\(@LABEL\s+([A-Z]+)\s+([^)]+)\)', func_name)
+                if label_match and label_match.group(1).upper() == "FUNCTION":
+                    func_name = f"\\operatorname{{{label_match.group(2)}}}"
+                else:
+                    func_name = self.parse_expression(func_name)
+            
+            return f"{func_name}({arg})"
+            
+        # Second pass: replace function applications
+        modified_expr = re.sub(func_pattern, replace_functions, modified_expr)
+        
+        # Replace operations
+        op_patterns = [
+            (r'\(/\s+([^)]+)\s+([^)]+)\)', r'\\frac{\1}{\2}'),  # Division
+            (r'\(\*\s+([^)]+)\s+([^)]+)\)', r'\1 \\cdot \2'),   # Multiplication
+            (r'\(\+\s+([^)]+)\s+([^)]+)\)', r'\1 + \2'),        # Addition
+            (r'\(-\s+([^)]+)\s+([^)]+)\)', r'\1 - \2'),         # Subtraction
+            (r'\(\^\s+([^)]+)\s+([^)]+)\)', r'{\1}^{\2}')       # Power
+        ]
+        
+        # Apply operation replacements
+        for pattern, replacement in op_patterns:
+            modified_expr = re.sub(pattern, replacement, modified_expr)
+            
+        # Remove any remaining MathCad-specific syntax
+        modified_expr = re.sub(r'\(@[A-Z_]+', '', modified_expr)
+        modified_expr = re.sub(r'\)', '', modified_expr)
+        
+        # If all else fails, fall back to standard parsing
+        if modified_expr == expression:
+            if expression.startswith("(/"):
+                return self._handle_division(expression)
+            elif expression.startswith("(*"):
+                return self._handle_multiplication(expression)
+            elif expression.startswith("(+"):
+                return self._handle_addition(expression)
+            elif expression.startswith("(-"):
+                return self._handle_subtraction(expression)
+            else:
+                # Just try standard parsing as a last resort
+                pattern = r'\(@([A-Z_]+)([^)]*)\)'
+                
+                def parse_special(match):
+                    cmd = match.group(1)
+                    args = match.group(2)
+                    method_name = f"_handle_{cmd.lower()}"
+                    if hasattr(self, method_name):
+                        handler = getattr(self, method_name)
+                        return handler(f"(@{cmd}{args})")
+                    return f"(@{cmd}{args})"
+                    
+                return re.sub(pattern, parse_special, expression)
+                
+        return modified_expr
+        
+    def _split_at_top_level(self, content):
+        """
+        Split content at top level spaces, correctly handling nested parentheses.
+        
+        Args:
+            content (str): The content to split
+            
+        Returns:
+            list: The split arguments
+        """
+        args = []
+        current_arg = ""
+        paren_level = 0
+        
+        for char in content:
+            if char == "(":
+                current_arg += char
+                paren_level += 1
+            elif char == ")":
+                current_arg += char
+                paren_level -= 1
+            elif char == " " and paren_level == 0 and current_arg.strip():
+                args.append(current_arg.strip())
+                current_arg = ""
+            else:
+                current_arg += char
+                
+        if current_arg.strip():
+            args.append(current_arg.strip())
+            
+        return args
+
     def _add_spaces_after_commands(self, latex):
         """
         Add spaces after LaTeX commands to ensure proper separation.
@@ -629,7 +830,7 @@ class MathcadToLatexTranslator:
         return f"\\left({inner_expr}\\right)"
     
     def _handle_label(self, expression):
-        """Handle labeled expressions like constants and units in MathCad."""
+        """Handle labeled expressions like constants, units, variables and functions in MathCad."""
         args = self._extract_arguments(expression)
         
         if not args:
@@ -686,9 +887,23 @@ class MathcadToLatexTranslator:
                 
             # Handle case where unit name is just a plain string
             return f"\\mathrm{{{unit_name}}}"
+        elif label_type.upper() == "VARIABLE":  # Handle VARIABLE labels
+            if len(args) < 2:
+                return ""
+                
+            var_name = args[1]
+            # Return the variable name as is, possibly in italic as per LaTeX math mode
+            return f"{var_name}"
+        elif label_type.upper() == "FUNCTION":  # Handle FUNCTION labels
+            if len(args) < 2:
+                return ""
+                
+            func_name = args[1]
+            # Format function names with \operatorname for proper math formatting
+            return f"\\operatorname{{{func_name}}}"
         
         # If we reach here, it's an unknown label type
-        return label_type
+        return self.parse_expression(args[1]) if len(args) > 1 else label_type
     
     def _handle_power(self, expression):
         """Handle power expressions in MathCad."""
@@ -704,31 +919,6 @@ class MathcadToLatexTranslator:
         if base == "e":
             return f"e^{{{exponent}}}"
         
-        return f"{{{base}}}^{{{exponent}}}"
-    
-    def _handle_power_operation(self, expression):
-        """Handle power expressions in MathCad."""
-        # Remove the '^' prefix from the expression
-        content = expression[2:-1].strip()
-        
-        # Extract arguments from the power operation
-        args = self._extract_arguments_from_op(content)
-        
-        if len(args) < 2:
-            return expression  # Return original if can't parse
-        
-        base = self.parse_expression(args[0])
-        exponent = self.parse_expression(args[1])
-        
-        # Special case for e (natural logarithm base)
-        if base == "e":
-            return f"e^{{{exponent}}}"
-        
-        # For simple variables, no need for extra braces
-        if len(base) == 1 and base.isalpha():
-            return f"{base}^{{{exponent}}}"
-        
-        # Otherwise wrap the base in braces for clarity
         return f"{{{base}}}^{{{exponent}}}"
     
     def _handle_multiplication(self, expression):
@@ -1535,15 +1725,32 @@ class MathcadToLatexTranslator:
             str: The equivalent LaTeX expression
         """
         latex_expr = self.parse_expression(mathcad_expr)
+        
+        # For long expressions, we'll let the equation environment handle it
+        # rather than trying to use a multline environment which causes issues
         return latex_expr
+
+
+# Function to simplify conversion, used by the GUI
+def convert_mathcad_to_latex(mathcad_expr):
+    """
+    Convert a MathCad expression to LaTeX format.
+    
+    Args:
+        mathcad_expr (str): The MathCad expression to convert
+        
+    Returns:
+        str: The equivalent LaTeX expression
+    """
+    translator = MathcadToLatexTranslator()
+    latex_expr = translator.translate(mathcad_expr)
+    return refine_latex(latex_expr)
 
 
 def refine_latex(latex_expression):
     """
-    Refine a LaTeX expression with additional formatting improvements.
-    
-    This function takes an already converted LaTeX expression and applies
-    additional refinements to make it more elegant and readable.
+    Refine a LaTeX expression for better typesetting and readability.
+    This function applies various improvements to already converted LaTeX expressions.
     
     Args:
         latex_expression (str): The LaTeX expression to refine
@@ -1551,67 +1758,143 @@ def refine_latex(latex_expression):
     Returns:
         str: The refined LaTeX expression
     """
-    # Skip empty expressions
-    if not latex_expression:
+    if not latex_expression or not isinstance(latex_expression, str):
         return latex_expression
     
-    refined = latex_expression
+    # Initialize refinement flag - will be set to True if any changes are made
+    refinements_made = False
+    refined_expression = latex_expression
     
-    # Replace common patterns with more elegant LaTeX
-    replacements = [
-        # Simplify fractions with simple numerators
-        (r'\\frac{([0-9])}{([^{}]+)}', r'\\frac{\\1}{\\2}'),
+    # 1. Improve fractions - convert simple divisions to proper \frac commands
+    pattern = r'(\w+|\([^)]+\)) *\/ *(\w+|\([^)]+\))'
+    if re.search(pattern, refined_expression):
+        def replace_with_frac(match):
+            nonlocal refinements_made
+            refinements_made = True
+            numerator = match.group(1)
+            denominator = match.group(2)
+            return f"\\frac{{{numerator}}}{{{denominator}}}"
         
-        # Improve display of square roots
-        (r'\\sqrt{([^{}]+)}', r'\\sqrt{\\1}'),
-        
-        # Simplify double fractions when possible
-        (r'\\frac{\\frac{([^{}]+)}{([^{}]+)}}{([^{}]+)}', r'\\frac{\\1}{\\2 \\cdot \\3}'),
-        
-        # Improve spacing around operators in exponents
-        (r'\^\{([^{}]*?)\+([^{}]*?)\}', r'^{\\1 + \\2}'),
-        (r'\^\{([^{}]*?)\-([^{}]*?)\}', r'^{\\1 - \\2}'),
-        
-        # Convert x*y to x \cdot y for better readability
-        (r'([a-zA-Z0-9])\*([a-zA-Z0-9])', r'\\1 \\cdot \\2'),
-        
-        # Improve display of integrals
-        (r'\\int\s*\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)', r'\\int_{\\3}^{\\4} \\1 \\, d\\2'),
-        
-        # Improve display of sums
-        (r'\\sum\s*\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)', r'\\sum_{\\2=\\3}^{\\4} \\1'),
-        
-        # Improve display of limits
-        (r'\\lim\s*\(([^,]+),\s*([^,]+),\s*([^)]+)\)', r'\\lim_{\\2 \\to \\3} \\1')
-    ]
+        refined_expression = re.sub(pattern, replace_with_frac, refined_expression)
     
-    import re
-    for pattern, replacement in replacements:
-        refined = re.sub(pattern, replacement, refined)
+    # 2. Improve spacing around operators
+    operators = ['+', '-', '=', r'\times', r'\cdot', '<', '>', r'\leq', r'\geq', r'\neq']
+    for op in operators:
+        # Escape any regex special characters in the operator
+        escaped_op = op
+        if op in ['+', '-', '*', '.', '(', ')', '[', ']', '{', '}', '\\']:
+            escaped_op = '\\' + op
+            
+        # Add proper spacing around operators but not within commands
+        pattern = f'([^\\\\]){escaped_op}([^\\s])'
+        if re.search(pattern, refined_expression):
+            refinements_made = True
+            refined_expression = re.sub(pattern, f'\\1 {op} \\2', refined_expression)
     
-    # Apply additional formatting rules
+    # 3. Improve superscripts and subscripts with proper command
+    # Convert x^2 to x^{2} for better clarity when expression is complex
+    superscript_pattern = r'(\w+)\^(\w)'
+    if re.search(superscript_pattern, refined_expression):
+        def replace_with_proper_superscript(match):
+            nonlocal refinements_made
+            refinements_made = True
+            base = match.group(1)
+            exponent = match.group(2)
+            return f"{base}^{{{exponent}}}"
+        
+        refined_expression = re.sub(superscript_pattern, replace_with_proper_superscript, refined_expression)
     
-    # Ensure proper spacing around equals signs
-    refined = refined.replace('=', ' = ')
-    # Remove double spaces
-    refined = refined.replace('  ', ' ')
+    # 4. Add \left and \right to large parentheses containing fractions
+    parentheses_pattern = r'\(([^()]*\\frac{[^{}]*}{[^{}]*}[^()]*)\)'
+    if re.search(parentheses_pattern, refined_expression):
+        def replace_with_left_right(match):
+            nonlocal refinements_made
+            refinements_made = True
+            content = match.group(1)
+            return f"\\left({content}\\right)"
+        
+        refined_expression = re.sub(parentheses_pattern, replace_with_left_right, refined_expression)
     
-    return refined
+    # 5. Enhance mathematical functions with proper formatting
+    math_funcs = ['sin', 'cos', 'tan', 'cot', 'sec', 'csc', 'arcsin', 'arccos', 'arctan', 
+                 'sinh', 'cosh', 'tanh', 'log', 'ln', 'exp', 'lim', 'max', 'min']
+    
+    for func in math_funcs:
+        # Look for function names without \ prefix
+        pattern = r'(?<![\\a-zA-Z])' + func + r'(?![a-zA-Z])'
+        if re.search(pattern, refined_expression):
+            refinements_made = True
+            refined_expression = re.sub(pattern, f'\\\\{func}', refined_expression)
+    
+    # 6. Improve display of integrals, sums, and products
+    # Add display style to make them larger in inline mode
+    for cmd in [r'\int', r'\sum', r'\prod']:
+        pattern = f'{cmd}((_{{[^}}]*}}\^{{[^}}]*}}))'
+        if re.search(pattern, refined_expression):
+            refinements_made = True
+            refined_expression = re.sub(pattern, f'\\\\displaystyle{cmd}\\1', refined_expression)
+    
+    # 7. Add \mathrm to units
+    units_pattern = r'([0-9]+) *([a-zA-Z]+)'
+    if re.search(units_pattern, refined_expression):
+        def process_units(match):
+            nonlocal refinements_made
+            number = match.group(1)
+            unit = match.group(2)
+            
+            # Skip if unit is likely a variable name or already processed
+            if unit in ['x', 'y', 'z', 'i', 'j', 'k', 't', 'n', 'a', 'b', 'c'] or '\\' in unit:
+                return match.group(0)
+            
+            refinements_made = True
+            return f"{number}\\,\\mathrm{{{unit}}}"
+            
+        refined_expression = re.sub(units_pattern, process_units, refined_expression)
+    
+    # 8. Add comment if no refinements were made
+    if not refinements_made:
+        refined_expression += "  % No further refinements available"
+    
+    return refined_expression
 
-
-def convert_mathcad_to_latex(expression):
+# Function to convert SVG for use in the GUI preview
+def latex_to_svg(latex_content, output_file, scale=1.0):
     """
-    Convert a MathCad expression to LaTeX format.
+    Convert LaTeX content to SVG format.
     
     Args:
-        expression (str): The MathCad expression to convert
-        
+        latex_content (str): The LaTeX math expression
+        output_file (str or file-like): The output file path or file-like object
+        scale (float): Scale factor for the output
+    
     Returns:
-        str: The equivalent LaTeX expression
+        None
     """
-    translator = MathcadToLatexTranslator()
-    return translator.parse_expression(expression)
-
+    # Check for matplotlib
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_svg import FigureCanvasSVG
+    
+    # Create a figure with transparent background
+    fig = plt.figure(figsize=(8, 4))
+    fig.patch.set_alpha(0.0)
+    
+    # Add text with the LaTeX formula
+    scaled_fontsize = 14 * scale
+    plt.text(0.5, 0.5, f"${latex_content}$", 
+             fontsize=scaled_fontsize, ha='center', va='center')
+    
+    # Remove axes
+    plt.axis('off')
+    
+    # Save as SVG
+    if hasattr(output_file, 'write'):
+        # It's a file-like object
+        plt.savefig(output_file, format='svg', bbox_inches='tight', transparent=True)
+    else:
+        # It's a file path
+        plt.savefig(output_file, format='svg', bbox_inches='tight', transparent=True)
+    
+    plt.close(fig)
 
 # If run directly
 if __name__ == "__main__":
@@ -1621,12 +1904,13 @@ if __name__ == "__main__":
         latex_result = convert_mathcad_to_latex(mathcad_expr)
         print(latex_result)
     else:
-        # Simple test cases
+        # Test cases with actual MathCad expressions
         test_expressions = [
-            "x + y",
-            "α + β",
-            "a/b",
-            "x^2"
+            "(@INTEGRAL 0 1 x^2 x)",
+            "(@FRACTION α β)",
+            "(@PARENS (*x y))",
+            "(@DERIV x 2 (@PARENS (*x y)))",
+            "(@SUM (@IS i 1) 10 i^2)"
         ]
         for expr in test_expressions:
             latex = convert_mathcad_to_latex(expr)
