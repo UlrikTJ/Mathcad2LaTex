@@ -13,12 +13,17 @@ import subprocess
 import threading
 import platform
 import tkinter as tk
+import io  # Add io module for BytesIO
+import warnings  # Import warnings module
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-from mathcad_to_latex import convert_mathcad_to_latex
+from mathcad_to_latex import MathcadToLatexTranslator
 
 # Import PIL modules at module level
 try:
     from PIL import Image, ImageTk
+    # Disable DecompressionBombWarning
+    Image.MAX_IMAGE_PIXELS = None  # Remove the pixel limit restriction
+    warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
 except ImportError:
     # PIL might not be installed, but we'll handle this in the rendering logic
     pass
@@ -181,6 +186,8 @@ class MathcadToLatexGUI:
         self._drag_data = {"x": 0, "y": 0, "item": None}
         self.current_scale = 1.0
         self.original_image = None
+        self.render_format = tk.StringVar(value="pdf")
+        self.first_render = False  # Track first render
         
         # Create main container with padding
         self.main_frame = ttk.Frame(root)
@@ -291,6 +298,15 @@ class MathcadToLatexGUI:
                                     style="Secondary.TButton")
         self.convert_btn.pack(side=tk.RIGHT, padx=(5, 0))
         
+        # Add copy button next to convert button
+        self.copy_button = ttk.Button(
+            self.controls_frame, 
+            text="Copy LaTeX", 
+            command=self._copy_latex,
+            style="Secondary.TButton"
+        )
+        self.copy_button.pack(side=tk.RIGHT, padx=(5, 0))
+        
         self.clear_btn = ttk.Button(self.controls_frame, 
                                   text="Clear", 
                                   command=self._clear_text,
@@ -357,39 +373,212 @@ class MathcadToLatexGUI:
         
         # Bind output text changes to allow automatic resizing
         self.output_text.bind("<<Modified>>", self._on_output_modified)
-
-        # Copy button with secondary style
-        self.copy_button = ttk.Button(
-            self.output_frame, 
-            text="Copy LaTeX", 
-            command=self._copy_latex,
-            style="Secondary.TButton"
-        )
-        self.copy_button.pack(anchor=tk.E, pady=5)
-        
-        # Continue iteration button
-        self.continue_button = ttk.Button(
-            self.output_frame,
-            text="Continue Iteration",
-            command=self._continue_iteration,
-            style="Accent.TButton"
-        )
-        self.continue_button.pack(anchor=tk.E, pady=5)
     
     def _setup_preview_section(self):
         """Set up the preview section with a LaTeX preview."""
-        self.preview_header = ttk.Label(self.preview_frame, 
-                                     text="LaTeX Preview",
-                                     style="Subheader.TLabel")
-        self.preview_header.pack(anchor=tk.W, pady=(10, 5), padx=10)
+        # Create main preview frame with a better structure
+        self.preview_main_frame = ttk.Frame(self.preview_frame)
+        self.preview_main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 5))
         
-        # Create a container with specific background color
-        self.preview_container = tk.Frame(self.preview_frame, 
+        # Create header with rendering option controls
+        preview_header_frame = ttk.Frame(self.preview_main_frame)
+        preview_header_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        self.preview_header = ttk.Label(preview_header_frame, 
+                                      text="LaTeX Preview",
+                                      style="Subheader.TLabel")
+        self.preview_header.pack(side=tk.LEFT)
+        
+        # Create a separate frame for toolbar
+        self.toolbar_frame = ttk.Frame(self.preview_main_frame)
+        self.toolbar_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        # Add zoom controls to the toolbar
+        zoom_out_btn = ttk.Button(self.toolbar_frame, 
+                                text="➖",
+                                width=3,
+                                command=self._zoom_out)
+        zoom_out_btn.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.zoom_level = ttk.Label(self.toolbar_frame,
+                                  text="100%",
+                                  width=8)
+        self.zoom_level.pack(side=tk.LEFT, padx=5)
+        
+        zoom_in_btn = ttk.Button(self.toolbar_frame, 
+                               text="➕",
+                               width=3,
+                               command=self._zoom_in)
+        zoom_in_btn.pack(side=tk.LEFT, padx=5)
+        
+        reset_zoom_btn = ttk.Button(self.toolbar_frame,
+                                  text="Reset to 100%",
+                                  command=self._reset_zoom)
+        reset_zoom_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Add fit-to-view button with a distinctive icon
+        fit_view_btn = ttk.Button(self.toolbar_frame,
+                                text="🔍 Fit to View",
+                                command=self._fit_to_view)
+        fit_view_btn.pack(side=tk.LEFT, padx=15)
+        
+        save_btn = ttk.Button(self.toolbar_frame,
+                            text="Save as Image",
+                            command=self._save_preview)
+        save_btn.pack(side=tk.RIGHT)
+        
+        # Create a container with specific background color - separate from toolbar
+        self.preview_container = tk.Frame(self.preview_main_frame, 
                                         background=ModernTheme.CARD_BG,
                                         highlightthickness=1,
                                         highlightbackground=ModernTheme.BG_DARK)
-        self.preview_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.preview_container.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # Bind keyboard shortcuts for zooming
+        self.root.bind("<Control-equal>", lambda e: self._zoom_in())
+        self.root.bind("<Control-plus>", lambda e: self._zoom_in())
+        self.root.bind("<Control-minus>", lambda e: self._zoom_out())
+        self.root.bind("<Control-0>", lambda e: self._fit_to_view())
     
+    def _zoom_in(self):
+        """Increase the zoom level."""
+        self.current_scale = min(5.0, self.current_scale * 1.25)
+        self.zoom_level.config(text=f"{int(self.current_scale * 100)}%")
+        self._apply_zoom()  # Apply zoom to existing image instead of re-rendering
+    
+    def _zoom_out(self):
+        """Decrease the zoom level."""
+        self.current_scale = max(0.25, self.current_scale / 1.25)
+        self.zoom_level.config(text=f"{int(self.current_scale * 100)}%")
+        self._apply_zoom()  # Apply zoom to existing image instead of re-rendering
+    
+    def _reset_zoom(self):
+        """Reset zoom level to 100%."""
+        if hasattr(self, 'original_image') and self.original_image is not None:
+            self.current_scale = 1.0
+            self.zoom_level.config(text="100%")
+            self._apply_zoom()
+    
+    def _fit_to_view(self):
+        """Adjust zoom to fit the equation to the preview container."""
+        if not hasattr(self, 'original_image') or self.original_image is None:
+            return
+            
+        # Get the preview container dimensions
+        container_width = self.preview_container.winfo_width() - 20  # Subtract padding
+        container_height = self.preview_container.winfo_height() - 20
+        
+        if container_width <= 0 or container_height <= 0:
+            # If container is not properly sized yet, use default dimensions
+            container_width = 600
+            container_height = 300
+        
+        # Make a copy of the original image for cropping
+        cropped_image = self.original_image.copy()
+        
+        # Auto-crop the image to focus on just the equation content
+        cropped_image = self._autocrop_image(cropped_image)
+        
+        if cropped_image.width == 0 or cropped_image.height == 0:
+            # Handle edge case of empty image
+            return
+            
+        # Calculate scale factors to fit width and height
+        width_scale = container_width / cropped_image.width
+        height_scale = container_height / cropped_image.height
+        
+        # Use the smaller scale to ensure entire equation fits
+        fit_scale = min(width_scale, height_scale) * 0.9  # Add a small margin
+        
+        # Set reasonable bounds for the scale
+        fit_scale = max(0.25, min(fit_scale, 5.0))
+        
+        # Update the scale and zoom label
+        self.current_scale = fit_scale
+        self.zoom_level.config(text=f"{int(self.current_scale * 100)}%")
+        
+        # Store the cropped image as the new original for display
+        self.original_image = cropped_image
+        
+        # Apply the zoom to the newly cropped image
+        self._apply_zoom()
+    
+    def _apply_zoom(self):
+        """Apply zoom to the existing image without re-rendering LaTeX."""
+        if not hasattr(self, 'original_image') or self.original_image is None:
+            # If there's no original image, we need to render it first
+            self._update_preview()
+            return
+            
+        # Clear only the preview container without affecting the toolbar
+        for widget in self.preview_container.winfo_children():
+            widget.destroy()
+            
+        # Resize the original image using the current scale
+        new_width = int(self.original_image.width * self.current_scale)
+        new_height = int(self.original_image.height * self.current_scale)
+        resized_image = self.original_image.resize((new_width, new_height), Image.LANCZOS)
+        
+        # Convert to PhotoImage for display
+        photo_image = ImageTk.PhotoImage(resized_image)
+        
+        # Get the current container dimensions
+        canvas_width = self.preview_container.winfo_width()
+        canvas_height = self.preview_container.winfo_height()
+        
+        # Ensure we have valid dimensions
+        if canvas_width <= 0:
+            canvas_width = 800
+        if canvas_height <= 0:
+            canvas_height = 400
+        
+        # Create canvas with scrollbars
+        canvas = tk.Canvas(self.preview_container, 
+                          width=canvas_width, 
+                          height=canvas_height,
+                          borderwidth=0, 
+                          highlightthickness=0, 
+                          bg=ModernTheme.CARD_BG)
+        
+        # Add scrollbars if needed
+        h_scrollbar = ttk.Scrollbar(self.preview_container, orient=tk.HORIZONTAL, command=canvas.xview)
+        v_scrollbar = ttk.Scrollbar(self.preview_container, orient=tk.VERTICAL, command=canvas.yview)
+        
+        # Configure canvas scrolling
+        canvas.configure(xscrollcommand=h_scrollbar.set, yscrollcommand=v_scrollbar.set)
+        
+        # Pack scrollbars only if needed
+        if new_width > canvas_width:
+            h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+        if new_height > canvas_height:
+            v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Create image on canvas
+        canvas_image = canvas.create_image(0, 0, anchor=tk.NW, image=photo_image)
+        canvas.photo = photo_image  # Keep reference to prevent garbage collection
+        
+        # Configure canvas scroll region
+        canvas.configure(scrollregion=(0, 0, new_width, new_height))
+        
+        # Center the image in the visible area
+        if new_width < canvas_width:
+            canvas.xview_moveto((new_width - canvas_width) / (2 * new_width) if new_width > 0 else 0)
+        else:
+            canvas.xview_moveto(0)
+        if new_height < canvas_height:
+            canvas.yview_moveto((new_height - canvas_height) / (2 * new_height) if new_height > 0 else 0)
+        else:
+            canvas.yview_moveto(0)
+        
+        # Enable dragging the image with the mouse
+        canvas.bind("<ButtonPress-1>", self._scroll_start)
+        canvas.bind("<B1-Motion>", self._scroll_move)
+        canvas.bind("<MouseWheel>", self._on_mousewheel)  # For Windows and MacOS
+        canvas.bind("<Button-4>", self._on_mousewheel)    # For Linux scroll up
+        canvas.bind("<Button-5>", self._on_mousewheel)    # For Linux scroll down
+
     def _convert_expression(self):
         """Convert Mathcad expression to LaTeX."""
         mathcad_expr = self.input_text.get(1.0, tk.END).strip()
@@ -401,7 +590,9 @@ class MathcadToLatexGUI:
             return
         
         try:
-            latex_expr = convert_mathcad_to_latex(mathcad_expr)
+            # Create a translator instance and use its translate method
+            translator = MathcadToLatexTranslator()
+            latex_expr = translator.translate(mathcad_expr)
             
             # Update output field
             self.output_text.delete(1.0, tk.END)
@@ -413,32 +604,6 @@ class MathcadToLatexGUI:
             self.output_text.delete(1.0, tk.END)
             self.output_text.insert(tk.END, f"Error: {str(e)}")
             self._update_preview()
-    
-    def _continue_iteration(self):
-        """Continue to the next iteration of LaTeX conversion refinement."""
-        # Get current LaTeX from output field
-        current_latex = self.output_text.get(1.0, tk.END).strip()
-        
-        if not current_latex:
-            messagebox.showinfo("Information", "No LaTeX to iterate on. Please convert an expression first.")
-            return
-            
-        try:
-            # You can define specific iteration rules here
-            # For example, simplifying fractions, expanding expressions, etc.
-            from mathcad_to_latex import refine_latex
-            
-            refined_latex = refine_latex(current_latex)
-            
-            # Update the output with the refined LaTeX
-            self.output_text.delete(1.0, tk.END)
-            self.output_text.insert(tk.END, refined_latex)
-            
-            # Update the preview
-            self._update_preview()
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to refine LaTeX: {str(e)}")
     
     def _clear_fields(self):
         """Clear input and output fields."""
@@ -470,465 +635,6 @@ class MathcadToLatexGUI:
         
         # Schedule the label to be removed after 2 seconds
         self.root.after(2000, copy_label.destroy)
-    
-    def _update_preview(self):
-        """Update the LaTeX preview with the current output."""
-        # Clear previous content
-        for widget in self.preview_container.winfo_children():
-            widget.destroy()
-        
-        # Get current LaTeX content
-        latex_content = self.output_text.get(1.0, tk.END).strip()
-        
-        if not latex_content:
-            # Show empty state with explicitly set background color
-            empty_frame = tk.Frame(self.preview_container, background=ModernTheme.CARD_BG)
-            empty_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)  # Fixed rely instead of duplicate relx
-            
-            empty_label = tk.Label(empty_frame,
-                                text="Enter a Mathcad expression to see preview",
-                                foreground=ModernTheme.TEXT_LIGHT,
-                                background=ModernTheme.CARD_BG,
-                                font=("Segoe UI", 11))
-            empty_label.pack()
-            return
-        
-        if latex_content.startswith("Error:"):
-            # Show error state with explicit background color
-            error_frame = tk.Frame(self.preview_container, background=ModernTheme.CARD_BG)
-            error_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)  # Fixed rely instead of duplicate relx
-            
-            error_label = tk.Label(error_frame,
-                                text=latex_content,
-                                foreground=ModernTheme.ERROR,
-                                background=ModernTheme.CARD_BG,
-                                font=("Segoe UI", 11))
-            error_label.pack()
-            return
-        
-        # Create a display for the LaTeX - prefer LaTeX over matplotlib
-        if HAS_LATEX:
-            self._render_with_latex(self.preview_container, latex_content)
-        elif MATPLOTLIB_AVAILABLE:
-            self._render_with_matplotlib(latex_content)
-        else:
-            self._render_text_preview(latex_content)
-    
-    def _render_with_matplotlib(self, latex_content):
-        """Render LaTeX using Matplotlib if available."""
-        try:
-            import matplotlib.pyplot as plt
-            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-            
-            # Create a frame with explicit background color
-            matplotlib_frame = tk.Frame(self.preview_container, background=ModernTheme.CARD_BG)
-            matplotlib_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-            
-            # Create figure with transparent background
-            fig = plt.figure(figsize=(5, 3), dpi=100)
-            fig.patch.set_facecolor('none')
-            
-            # Display the LaTeX expression
-            plt.text(0.5, 0.5, f"${latex_content}$", 
-                    fontsize=14, ha='center', va='center')
-            
-            # Hide axes
-            plt.axis('off')
-            
-            # Create canvas
-            canvas = FigureCanvasTkAgg(fig, master=matplotlib_frame)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-            
-        except Exception as e:
-            # Fall back to text preview if rendering fails
-            error_msg = f"Failed to render with Matplotlib: {str(e)}"
-            self._render_text_preview(latex_content, error=error_msg)
-    
-    def _render_text_preview(self, latex_content, error=None, use_latex=False):
-        """Render a text-based preview of the LaTeX."""
-        # Create a frame with explicit background color
-        preview_frame = tk.Frame(self.preview_container, background=ModernTheme.CARD_BG)
-        preview_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        if error:
-            # Show error message with explicit background color
-            error_label = tk.Label(preview_frame,
-                                text=error,
-                                foreground=ModernTheme.ERROR,
-                                background=ModernTheme.CARD_BG,
-                                font=("Segoe UI", 10),
-                                wraplength=300)
-            error_label.pack(pady=10)
-        
-        # Add rendered example if LaTeX is installed
-        if use_latex:
-            try:
-                self._render_with_latex(preview_frame, latex_content)
-            except Exception as e:
-                error_label = tk.Label(preview_frame,
-                                    text=f"LaTeX rendering failed: {str(e)}",
-                                    foreground=ModernTheme.ERROR,
-                                    background=ModernTheme.CARD_BG,
-                                    font=("Segoe UI", 10))
-                error_label.pack(pady=10)
-        else:
-            # Only show text preview if LaTeX rendering is not available
-            # Create a Text widget with special formatting to highlight LaTeX syntax
-            preview_text = tk.Text(preview_frame,
-                                height=8,
-                                width=40,
-                                font=("Consolas", 12),
-                                bg=ModernTheme.BG_DARK,
-                                fg=ModernTheme.TEXT,
-                                padx=15,
-                                pady=15,
-                                wrap=tk.WORD,
-                                relief=tk.FLAT)
-            preview_text.pack(fill=tk.BOTH, expand=True, pady=5)
-            preview_text.insert(tk.END, latex_content)
-            preview_text.config(state=tk.DISABLED)
-    
-    def _render_with_latex(self, parent_frame, latex_content):
-        """Render using LaTeX if installed."""
-        try:
-            # Create a temporary directory for LaTeX files
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # Create a minimal LaTeX document with additional padding and adjustments
-                # Use the varwidth package to properly handle the width and prevent cutoffs
-                latex_doc = f"""\\documentclass{{standalone}}
-\\usepackage{{amsmath,amssymb}}
-\\usepackage{{varwidth}}
-\\usepackage[active,tightpage,displaymath,textmath]{{preview}}
-\\setlength\\PreviewBorder{{5pt}}
-\\begin{{document}}
-\\begin{{varwidth}}{{\\linewidth}}
-$${latex_content}$$
-\\end{{varwidth}}
-\\end{{document}}
-"""
-                
-                # Write LaTeX document to temporary file
-                tex_file = os.path.join(temp_dir, "preview.tex")
-                with open(tex_file, "w", encoding="utf-8") as f:
-                    f.write(latex_doc)
-                
-                # Compile LaTeX document to PDF
-                process = subprocess.run(
-                    ["pdflatex", "-interaction=nonstopmode", "-output-directory", temp_dir, tex_file],
-                    capture_output=True,
-                    text=True
-                )
-                
-                if process.returncode != 0:
-                    # Show compilation error
-                    error_frame = tk.Frame(parent_frame, bg=ModernTheme.BG_COLOR)
-                    error_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-                    
-                    error_label = ttk.Label(
-                        error_frame,
-                        text="LaTeX compilation error:",
-                        font=("Segoe UI", 10, "bold"),
-                        foreground=ModernTheme.ERROR
-                    )
-                    error_label.pack(anchor=tk.W)
-                    
-                    # Get the specific error message from the LaTeX output
-                    error_lines = [line for line in process.stdout.split('\n') 
-                                  if line.startswith('!') or 'Error:' in line]
-                    error_message = '\n'.join(error_lines[:3]) if error_lines else "Unknown error"
-                    
-                    error_text = tk.Text(
-                        error_frame,
-                        height=4,
-                        width=40,
-                        font=("Consolas", 9),
-                        bg=ModernTheme.BG_DARK,
-                        fg=ModernTheme.ERROR,
-                        wrap=tk.WORD
-                    )
-                    error_text.pack(fill=tk.X, pady=5)
-                    error_text.insert(tk.END, error_message)
-                    error_text.config(state=tk.DISABLED)
-                    return
-                
-                # If available, convert PDF to image for display
-                if platform.system() == "Windows":
-                    try:
-                        from PIL import Image, ImageTk
-                        import pdf2image
-                        
-                        # Convert PDF to image with higher DPI for better quality
-                        pdf_file = os.path.join(temp_dir, "preview.pdf")
-                        images = pdf2image.convert_from_path(pdf_file, dpi=1000)  # Increased DPI for higher quality
-                        
-                        if images:
-                            # Create a container to display the image that fills the entire preview area
-                            img_frame = ttk.Frame(parent_frame)
-                            img_frame.pack(fill=tk.BOTH, expand=True)
-                            
-                            # Get the initial container size
-                            parent_frame.update_idletasks()  # Update to get correct dimensions
-                            frame_width = parent_frame.winfo_width()
-                            frame_height = parent_frame.winfo_height()
-                            
-                            # Create a canvas to hold the image and allow for proper sizing
-                            canvas = tk.Canvas(img_frame, 
-                                              background=ModernTheme.CARD_BG,
-                                              highlightthickness=0,
-                                              bd=0)
-                            canvas.pack(fill=tk.BOTH, expand=True)
-                            
-                            # Process the image
-                            pil_image = images[0]
-                            img_width, img_height = pil_image.size
-                            
-                            # Calculate the appropriate scale to fit the frame while maintaining aspect ratio
-                            # Use 85% of available space to avoid edge cutoff
-                            width_ratio = frame_width / img_width * 0.85
-                            height_ratio = frame_height / img_height * 0.85
-                            scale_factor = min(width_ratio, height_ratio)
-                            
-                            # Calculate new dimensions
-                            new_width = int(img_width * scale_factor)
-                            new_height = int(img_height * scale_factor)
-                            
-                            # Resize the image using LANCZOS for better quality
-                            if scale_factor != 1:
-                                pil_image = pil_image.resize((new_width, new_height), Image.LANCZOS)
-                            
-                            # Save original image for zooming
-                            self.original_image = pil_image
-                            self.current_scale = 1.0
-                            
-                            # Convert to PhotoImage
-                            img_tk = ImageTk.PhotoImage(pil_image)
-                            
-                            # Create image on canvas, centered
-                            img_id = canvas.create_image(frame_width//2, frame_height//2, anchor=tk.CENTER, image=img_tk)
-                            canvas.image = img_tk  # Keep a reference to prevent garbage collection
-                            
-                            # Variables for panning
-                            self._drag_data = {"x": 0, "y": 0, "item": img_id}
-                            
-                            # Bind mouse events for zooming and panning
-                            canvas.bind("<ButtonPress-1>", lambda event, canvas=canvas: self._start_drag(event, canvas))
-                            canvas.bind("<B1-Motion>", lambda event, canvas=canvas: self._drag(event, canvas))
-                            canvas.bind("<MouseWheel>", lambda event, canvas=canvas, pil_image=pil_image: self._zoom(event, canvas, pil_image))
-                            # For Linux/Mac systems which use different mouse wheel events
-                            canvas.bind("<Button-4>", lambda event, canvas=canvas, pil_image=pil_image: self._zoom_linux(event, canvas, pil_image, 1))
-                            canvas.bind("<Button-5>", lambda event, canvas=canvas, pil_image=pil_image: self._zoom_linux(event, canvas, pil_image, -1))
-                            
-                            # Add resize handler to keep image centered and appropriately sized
-                            def on_resize(event):
-                                # Update canvas dimensions
-                                w, h = event.width, event.height
-                                canvas.delete("all")  # Clear the canvas
-                                
-                                # Calculate new dimensions for the image
-                                width_ratio = w / img_width * 0.85
-                                height_ratio = h / img_height * 0.85
-                                scale = min(width_ratio, height_ratio)
-                                
-                                new_w = int(img_width * scale * self.current_scale)
-                                new_h = int(img_height * scale * self.current_scale)
-                                
-                                # Resize the image with high quality resampling
-                                resized_img = self.original_image.resize((new_w, new_h), Image.LANCZOS)
-                                new_img_tk = ImageTk.PhotoImage(resized_img)
-                                
-                                # Place the new image
-                                img_id = canvas.create_image(w//2, h//2, anchor=tk.CENTER, image=new_img_tk)
-                                canvas.image = new_img_tk  # Keep a reference
-                                self._drag_data["item"] = img_id
-                            
-                            # Bind the resize event
-                            canvas.bind("<Configure>", on_resize)
-                            
-                            # Add zoom control buttons
-                            control_frame = tk.Frame(img_frame, bg=ModernTheme.CARD_BG)
-                            control_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
-                            
-                            zoom_in_btn = ttk.Button(control_frame, text="Zoom In", 
-                                                  command=lambda: self._zoom_button(canvas, pil_image, 1.1))
-                            zoom_in_btn.pack(side=tk.LEFT, padx=5)
-                            
-                            zoom_out_btn = ttk.Button(control_frame, text="Zoom Out", 
-                                                   command=lambda: self._zoom_button(canvas, pil_image, 0.9))
-                            zoom_out_btn.pack(side=tk.LEFT, padx=5)
-                            
-                            reset_btn = ttk.Button(control_frame, text="Reset View", 
-                                                   command=lambda: self._reset_view(canvas, self.original_image))
-                            reset_btn.pack(side=tk.LEFT, padx=5)
-                            
-                            # Add instructions label
-                            instruction_label = ttk.Label(
-                                control_frame,
-                                text="Drag to pan • Mouse wheel to zoom",
-                                font=("Segoe UI", 8),
-                                foreground=ModernTheme.TEXT_LIGHT
-                            )
-                            instruction_label.pack(side=tk.RIGHT, padx=10)
-                            
-                            return
-                    except (ImportError, Exception) as e:
-                        # Fall through to the message below if we can't render the image
-                        pass
-                
-                # If we couldn't render the image (e.g., missing dependencies),
-                # show a message about successful compilation
-                success_label = ttk.Label(
-                    parent_frame,
-                    text="LaTeX compiled successfully! Install PIL and pdf2image to view the rendered output.",
-                    font=("Segoe UI", 11),
-                    foreground=ModernTheme.SUCCESS,
-                    wraplength=350
-                )
-                success_label.pack(pady=10)
-                
-        except Exception as e:
-            # Show error message
-            error_label = ttk.Label(
-                parent_frame,
-                text=f"Error rendering LaTeX: {str(e)}",
-                font=("Segoe UI", 10),
-                foreground=ModernTheme.ERROR,
-                wraplength=350
-            )
-            error_label.pack(pady=10)
-            
-    def _start_drag(self, event, canvas):
-        """Start panning the image."""
-        # Record the initial coordinates when drag begins
-        self._drag_data["x"] = event.x
-        self._drag_data["y"] = event.y
-        
-    def _drag(self, event, canvas):
-        """Pan the image as the mouse moves."""
-        # Calculate the distance moved
-        dx = event.x - self._drag_data["x"]
-        dy = event.y - self._drag_data["y"]
-        
-        # Move the image
-        canvas.move(self._drag_data["item"], dx, dy)
-        
-        # Record the new position
-        self._drag_data["x"] = event.x
-        self._drag_data["y"] = event.y
-    
-    def _zoom(self, event, canvas, original_image):
-        """Zoom in/out with the mouse wheel (Windows)."""
-        # Get scale factor based on wheel direction
-        if event.delta > 0:
-            scale_factor = 1.1  # Zoom in
-        else:
-            scale_factor = 0.9  # Zoom out
-            
-        self._apply_zoom(canvas, original_image, scale_factor, event.x, event.y)
-    
-    def _zoom_linux(self, event, canvas, original_image, direction):
-        """Zoom in/out with the mouse wheel (Linux/Mac)."""
-        scale_factor = 1.1 if direction > 0 else 0.9
-        self._apply_zoom(canvas, original_image, scale_factor, event.x, event.y)
-    
-    def _zoom_button(self, canvas, original_image, scale_factor):
-        """Zoom in/out using buttons."""
-        # Calculate the center of the canvas for zoom origin
-        canvas_width = canvas.winfo_width()
-        canvas_height = canvas.winfo_height()
-        self._apply_zoom(canvas, original_image, scale_factor, canvas_width//2, canvas_height//2)
-    
-    def _apply_zoom(self, canvas, original_image, scale_factor, x, y):
-        """Apply zoom at a specific point with a scale factor."""
-        # Update current scale
-        self.current_scale *= scale_factor
-        
-        # Limit zoom level to reasonable bounds
-        if self.current_scale < 0.2:
-            self.current_scale = 0.2
-        elif self.current_scale > 5.0:
-            self.current_scale = 5.0
-        
-        # Get the original image size
-        img_width, img_height = original_image.size
-        
-        # Calculate new dimensions
-        new_width = int(img_width * self.current_scale)
-        new_height = int(img_height * self.current_scale)
-        
-        # Resize with high quality
-        resized_img = self.original_image.resize((new_width, new_height), Image.LANCZOS)
-        new_img_tk = ImageTk.PhotoImage(resized_img)
-        
-        # Get current position of the image
-        img_id = self._drag_data["item"]
-        current_coords = canvas.coords(img_id)
-        
-        if current_coords:
-            # Calculate zoom point relative to image
-            current_x, current_y = current_coords
-            rel_x = (x - current_x) / (new_width / scale_factor)
-            rel_y = (y - current_y) / (new_height / scale_factor)
-            
-            # Calculate new position after zoom
-            new_x = x - rel_x * scale_factor
-            new_y = y - rel_y * scale_factor
-            
-            # Remove old image and create new one
-            canvas.delete(img_id)
-            new_img_id = canvas.create_image(new_x, new_y, image=new_img_tk)
-            
-            # Update references
-            canvas.image = new_img_tk
-            self._drag_data["item"] = new_img_id
-        else:
-            # If no current coordinates, just center the image
-            canvas_width = canvas.winfo_width()
-            canvas_height = canvas.winfo_height()
-            
-            # Remove old image and create new one
-            canvas.delete(img_id)
-            new_img_id = canvas.create_image(canvas_width//2, canvas_height//2, 
-                                           anchor=tk.CENTER, image=new_img_tk)
-            
-            # Update references
-            canvas.image = new_img_tk
-            self._drag_data["item"] = new_img_id
-    
-    def _reset_view(self, canvas, original_image):
-        """Reset the view to original position and scale."""
-        # Reset scale to 1.0
-        self.current_scale = 1.0
-        
-        # Get the original image size
-        img_width, img_height = original_image.size
-        
-        # Get canvas dimensions
-        canvas_width = canvas.winfo_width()
-        canvas_height = canvas.winfo_height()
-        
-        # Calculate the appropriate scale to fit the canvas while maintaining aspect ratio
-        # Use 85% of available space to avoid edge cutoff
-        width_ratio = canvas_width / img_width * 0.85
-        height_ratio = canvas_height / img_height * 0.85
-        scale_factor = min(width_ratio, height_ratio)
-        
-        # Calculate new dimensions
-        new_width = int(img_width * scale_factor)
-        new_height = int(img_height * scale_factor)
-        
-        # Resize the image using LANCZOS for better quality
-        resized_img = self.original_image.resize((new_width, new_height), Image.LANCZOS)
-        new_img_tk = ImageTk.PhotoImage(resized_img)
-        
-        # Remove old image and create new one at center
-        canvas.delete(self._drag_data["item"])
-        new_img_id = canvas.create_image(canvas_width//2, canvas_height//2, 
-                                       anchor=tk.CENTER, image=new_img_tk)
-        
-        # Update references
-        canvas.image = new_img_tk
-        self._drag_data["item"] = new_img_id
 
     def _clear_text(self):
         """Clear the input and output fields."""
@@ -1043,6 +749,382 @@ $${latex_content}$$
             # Update sash positions
             self.vertical_paned_window.sashpos(0, first_sash)
             self.vertical_paned_window.sashpos(1, second_sash)
+
+    def _render_error(self, container, error_message):
+        """Render an error message in the preview container."""
+        # Clear any existing content
+        for widget in container.winfo_children():
+            widget.destroy()
+        
+        # Create a frame with explicit background color
+        error_frame = tk.Frame(container, background=ModernTheme.CARD_BG)
+        error_frame.place(relx=0.5, relwidth=0.8, rely=0.5, anchor=tk.CENTER)
+        
+        # Create the error message with red text
+        error_label = tk.Label(error_frame,
+                            text=error_message,
+                            foreground=ModernTheme.ERROR,
+                            background=ModernTheme.CARD_BG,
+                            font=("Segoe UI", 11),
+                            wraplength=container.winfo_width() - 40)  # Allow wrapping with margin
+        error_label.pack(padx=10, pady=10)
+
+    def _create_latex_document(self, latex_content):
+        """
+        Create a complete LaTeX document containing the given LaTeX expression.
+        
+        Args:
+            latex_content (str): The LaTeX equation or expression to include
+            
+        Returns:
+            str: Complete LaTeX document as a string
+        """
+        # Create a standard LaTeX document structure with appropriate packages
+        # Using wider margins and landscape orientation for longer expressions
+        document = r"""
+\documentclass[12pt]{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsfonts}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage[landscape,margin=0.1in]{geometry}
+\pagestyle{empty}
+
+\begin{document}
+\begin{center}
+\begin{equation*}
+""" + latex_content + r"""
+\end{equation*}
+\end{center}
+\end{document}
+"""
+        return document
+        
+    def _render_text_preview(self, latex_content):
+        """Render a simple text preview of the LaTeX content when better rendering is not available."""
+        # Clear any existing content
+        for widget in self.preview_container.winfo_children():
+            widget.destroy()
+            
+        # Create a frame with a light background
+        preview_frame = tk.Frame(self.preview_container, background=ModernTheme.CARD_BG)
+        preview_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        
+        # Create an informative message
+        message_label = tk.Label(preview_frame,
+                                text="LaTeX Preview (Text Only):",
+                                foreground=ModernTheme.PRIMARY,
+                                background=ModernTheme.CARD_BG,
+                                font=("Segoe UI", 11, "bold"))
+        message_label.pack(pady=(10, 5))
+        
+        # Create a text widget to display the LaTeX content
+        text_preview = scrolledtext.ScrolledText(preview_frame,
+                                              width=60,
+                                              height=10,
+                                              font=("Consolas", 12),
+                                              bg=ModernTheme.BG_COLOR,
+                                              fg=ModernTheme.TEXT,
+                                              relief=tk.FLAT,
+                                              padx=10,
+                                              pady=10)
+        text_preview.pack(padx=20, pady=10)
+        
+        # Insert the LaTeX content
+        text_preview.insert(tk.END, latex_content)
+        text_preview.config(state=tk.DISABLED)  # Make it read-only
+        
+        # Add a note about installation
+        note_label = tk.Label(preview_frame,
+                            text="Note: Install LaTeX or matplotlib for rendered previews",
+                            foreground=ModernTheme.TEXT_LIGHT,
+                            background=ModernTheme.CARD_BG,
+                            font=("Segoe UI", 9, "italic"))
+        note_label.pack(pady=(0, 10))
+    
+    def _update_preview(self):
+        """Update the LaTeX preview with the current output."""
+        # Clear any existing content
+        for widget in self.preview_container.winfo_children():
+            widget.destroy()
+            
+        # Get the LaTeX content from the output text
+        latex_content = self.output_text.get(1.0, tk.END).strip()
+        
+        if not latex_content:
+            # If there's no content, show an empty placeholder
+            self._render_error(self.preview_container, "No LaTeX to preview. Enter a Mathcad expression and convert it.")
+            return
+        
+        if latex_content.startswith("Error:"):
+            # Show error message
+            self._render_error(self.preview_container, latex_content)
+            return
+        
+        # Check if we should use PDF rendering
+        use_svg = False
+        
+        # Try to render the LaTeX using different methods
+        self._render_latex_preview(latex_content, use_svg)
+            
+    def _render_latex_preview(self, latex_content, use_svg=False):
+        """Render LaTeX preview using the best available method."""
+        try:
+            # First try to use LaTeX if it's installed (best quality)
+            if HAS_LATEX:
+                self._render_with_latex(latex_content, use_svg)
+            # If LaTeX isn't available, try matplotlib (decent quality)
+            elif MATPLOTLIB_AVAILABLE:
+                self._render_with_matplotlib(latex_content)
+            # If nothing else is available, just show text preview
+            else:
+                self._render_text_preview(latex_content)
+        except Exception as e:
+            # If rendering fails, show error
+            self._render_error(self.preview_container, f"Error rendering preview: {str(e)}")
+            
+    def _render_with_latex(self, latex_content, use_svg=False):
+        """Render LaTeX using native LaTeX compiler."""
+        # Create a temporary directory to work in
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Create paths for the files
+            tex_file = os.path.join(temp_dir, "preview.tex")
+            
+            # Create the full LaTeX document
+            document = self._create_latex_document(latex_content)
+            
+            # Write the LaTeX document to a temporary file
+            with open(tex_file, "w", encoding="utf-8") as f:
+                f.write(document)
+            
+            # Determine output format based on user selection
+            output_format = "pdf"
+                
+            # Run LaTeX command to generate output
+            try:
+                if output_format == "pdf":
+                    # Run pdflatex to generate PDF
+                    process = subprocess.run(
+                        ["pdflatex", "-interaction=nonstopmode", "-output-directory", temp_dir, tex_file],
+                        capture_output=True,
+                        timeout=5
+                    )
+                    
+                    # Check if the compilation was successful
+                    if process.returncode != 0:
+                        error_msg = process.stderr.decode('utf-8', errors='replace')
+                        # Show just the most relevant part of the error
+                        if "!" in error_msg:
+                            error_msg = error_msg[error_msg.find("!"):]
+                            error_msg = error_msg[:error_msg.find("\n\n")]
+                        raise Exception(f"LaTeX compilation failed: {error_msg}")
+                    
+                    # Convert PDF to image using PIL
+                    pdf_file = os.path.join(temp_dir, "preview.pdf")
+                    self._render_pdf_preview(pdf_file)
+            
+            except subprocess.TimeoutExpired:
+                raise Exception("LaTeX compilation timed out. The expression might be too complex.")
+                
+    def _render_pdf_preview(self, pdf_file):
+        """Render a PDF file as an image in the preview container."""
+        try:
+            # Try to convert PDF to image using Pillow with pdf2image
+            from pdf2image import convert_from_path
+            
+            # Convert first page of PDF to image
+            images = convert_from_path(pdf_file, dpi=600, first_page=1, last_page=1)
+            if not images:
+                raise Exception("Failed to convert PDF to image")
+                
+            # Save the original image for zooming
+            self.original_image = self._autocrop_image(images[0])
+            
+            # Apply the current zoom level to the image
+            self._apply_zoom()
+                
+        except ImportError:
+            # If pdf2image or poppler is not installed
+            self._render_error(self.preview_container, 
+                            "PDF to image conversion requires pdf2image package.\n"
+                            "Install it with: pip install pdf2image\n"
+                            "And ensure poppler is installed on your system.")
+            
+    def _render_with_matplotlib(self, latex_content):
+        """Render LaTeX using matplotlib's math rendering."""
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib import rcParams
+            import io
+            
+            # Configure matplotlib for LaTeX rendering
+            rcParams['text.usetex'] = True
+            rcParams['font.family'] = 'serif'
+            rcParams['font.serif'] = ['Computer Modern Roman']
+            rcParams['text.latex.preamble'] = r'\usepackage{amsmath} \usepackage{amssymb} \usepackage{amsfonts}'
+            
+            # Create a figure with appropriate size
+            fig = plt.figure(figsize=(12, 8), dpi=100)
+            
+            # No axes, just the equation
+            ax = fig.add_axes([0, 0, 1, 1])
+            ax.set_axis_off()
+            
+            # Place the equation in the center
+            ax.text(0.5, 0.5, f"${latex_content}$", 
+                  fontsize=18, ha='center', va='center')
+            
+            # Render to a PIL Image
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=150, 
+                      bbox_inches='tight', pad_inches=0.1)
+            plt.close(fig)
+            
+            # Open the image from the buffer
+            buf.seek(0)
+            image = Image.open(buf)
+            
+            # Save the original image for zooming
+            self.original_image = self._autocrop_image(image)
+            
+            # Apply the current zoom level to the image
+            self._apply_zoom()
+            
+        except Exception as e:
+            # If matplotlib rendering fails
+            self._render_error(self.preview_container, 
+                            f"Matplotlib rendering failed: {str(e)}\n"
+                            f"Try installing LaTeX for better rendering.")
+            
+    def _save_preview(self):
+        """Save the current preview image to a file."""
+        if not hasattr(self, 'original_image') or self.original_image is None:
+            messagebox.showinfo("Save Preview", "Nothing to save. Generate a preview first.")
+            return
+            
+        # Ask for file location
+        file_types = [
+            ("PNG Image", "*.png"),
+            ("JPEG Image", "*.jpg"),
+            ("All Files", "*.*")
+        ]
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=file_types,
+            title="Save Preview As"
+        )
+        
+        if not file_path:
+            return  # User cancelled
+            
+        try:
+            # Save the image
+            self.original_image.save(file_path)
+            messagebox.showinfo("Save Preview", f"Preview saved successfully to:\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save preview: {str(e)}")
+            
+    def _scroll_start(self, event):
+        """Start scrolling/dragging the image."""
+        self._drag_data["item"] = event.widget
+        self._drag_data["x"] = event.x
+        self._drag_data["y"] = event.y
+        
+    def _scroll_move(self, event):
+        """Handle mouse dragging to scroll the canvas."""
+        if not self._drag_data["item"]:
+            return
+            
+        # Calculate the distance moved
+        dx = self._drag_data["x"] - event.x
+        dy = self._drag_data["y"] - event.y
+        
+        # Update canvas scroll position
+        canvas = self._drag_data["item"]
+        canvas.xview_scroll(dx, "units")
+        canvas.yview_scroll(dy, "units")
+        
+        # Update the drag start position
+        self._drag_data["x"] = event.x
+        self._drag_data["y"] = event.y
+        
+    def _on_mousewheel(self, event):
+        """Handle mousewheel events for scrolling."""
+        canvas = event.widget
+        
+        # Determine scroll direction and amount based on platform
+        if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+            # Scroll up
+            canvas.yview_scroll(-1, "units")
+        elif event.num == 5 or (hasattr(event, 'delta') and event.delta < 0):
+            # Scroll down
+            canvas.yview_scroll(1, "units")
+    
+    def _autocrop_image(self, image, padding=10):
+        """
+        Automatically crop an image to its content with optional padding.
+        
+        Args:
+            image: PIL image to crop
+            padding: Padding to add around the content in pixels
+            
+        Returns:
+            PIL Image: Cropped image, or original if no content found
+        """
+        # Convert to grayscale for content detection
+        grayscale = image.convert('L')
+        
+        # Get content bounding box
+        bbox = self._get_content_bbox(grayscale)
+        
+        if not bbox:
+            return image  # No content found, return original
+        
+        # Unpack bounding box
+        left, top, right, bottom = bbox
+        
+        # Add padding
+        left = max(0, left - padding)
+        top = max(0, top - padding)
+        right = min(image.width, right + padding)
+        bottom = min(image.height, bottom + padding)
+        
+        # Crop to content
+        return image.crop((left, top, right, bottom))
+    
+    def _get_content_bbox(self, grayscale_image, threshold=245):
+        """
+        Find the bounding box of content in a grayscale image.
+        
+        Args:
+            grayscale_image: Grayscale PIL image
+            threshold: Pixel value threshold (0-255) to determine content vs background
+            
+        Returns:
+            tuple: (left, top, right, bottom) or None if no content found
+        """
+        width, height = grayscale_image.size
+        pixels = grayscale_image.load()
+        
+        # Find content boundaries
+        left, top, right, bottom = width, height, 0, 0
+        found_content = False
+        
+        # Scan for content
+        for y in range(height):
+            for x in range(width):
+                # If pixel is darker than threshold, it's content
+                if pixels[x, y] < threshold:
+                    found_content = True
+                    left = min(left, x)
+                    top = min(top, y)
+                    right = max(right, x)
+                    bottom = max(bottom, y)
+        
+        if found_content:
+            return (left, top, right, bottom)
+        return None
 
 def main():
     """Main function to run the application."""
